@@ -1,19 +1,10 @@
+local serializer = require("europadb.storage.serializer")
 local proto = {}
 
 -- Message Header: 1 byte Type + 4 bytes Payload Length (Big Endian)
-local function pack_u32(n)
-    local b1 = math.floor(n / 16777216) % 256
-    local b2 = math.floor(n / 65536) % 256
-    local b3 = math.floor(n / 256) % 256
-    local b4 = n % 256
-    return string.char(b1, b2, b3, b4)
-end
-
+local pack_u32 = serializer.pack_uint32
 local function unpack_u32(str, pos)
-    pos = pos or 1
-    local b1, b2, b3, b4 = string.byte(str, pos, pos + 3)
-    if not b1 or not b2 or not b3 or not b4 then return 0 end
-    return b1 * 16777216 + b2 * 65536 + b3 * 256 + b4
+    return serializer.unpack_uint32(str, pos) or 0
 end
 
 function proto.make_msg(msg_type, payload)

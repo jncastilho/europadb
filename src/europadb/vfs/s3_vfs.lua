@@ -17,16 +17,20 @@ function S3VFS.new(config)
     return self
 end
 
+local function shell_quote(s)
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
 -- Default HTTP requester using popen curl or http_handler
 function S3VFS:_http_request(method, path, headers, body)
     if self.http_handler then
         return self.http_handler(method, self.endpoint .. path, headers, body)
     end
 
-    -- CLI cURL fallback execution
-    local cmd = { "curl -s -i -X " .. method }
+    -- CLI cURL fallback execution (all arguments safely single-quote escaped)
+    local cmd = { "curl -s -i -X " .. shell_quote(method) }
     for k, v in pairs(headers) do
-        table.insert(cmd, string.format('-H "%s: %s"', k, v))
+        table.insert(cmd, "-H " .. shell_quote(tostring(k) .. ": " .. tostring(v)))
     end
     local tmp_file_path = nil
     if body and #body > 0 then
@@ -35,10 +39,10 @@ function S3VFS:_http_request(method, path, headers, body)
         if f then
             f:write(body)
             f:close()
-            table.insert(cmd, string.format('--data-binary "@%s"', tmp_file_path))
+            table.insert(cmd, "--data-binary " .. shell_quote("@" .. tmp_file_path))
         end
     end
-    table.insert(cmd, string.format('"%s%s"', self.endpoint, path))
+    table.insert(cmd, shell_quote(self.endpoint .. path))
 
     local exec_cmd = table.concat(cmd, " ")
     local handle = io.popen(exec_cmd)

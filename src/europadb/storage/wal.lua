@@ -78,6 +78,9 @@ function WAL:sync_wal_index()
     end
     if current_size >= self.wal_indexed_size + WAL.FRAME_SIZE then
         local offset = self.wal_indexed_size
+        local last_committed_offset = self.wal_indexed_size
+        local cur_tx_frames = {}
+        local current_tx_id = nil
         while offset + WAL.FRAME_SIZE <= current_size do
             local frame_data = self.wal_file:read(offset, WAL.FRAME_SIZE)
             if not frame_data or #frame_data < WAL.FRAME_SIZE then break end
@@ -93,13 +96,24 @@ function WAL:sync_wal_index()
                             serializer.pack_uint32(tx_id) ..
                             page_payload
             if adler32(payload) == stored_cksum then
-                self.wal_frame_index[page_id] = offset
+                if current_tx_id ~= tx_id then
+                    cur_tx_frames = {}
+                    current_tx_id = tx_id
+                end
+                table.insert(cur_tx_frames, { page_id = page_id, offset = offset })
+                if commit_flag == 1 then
+                    for _, f in ipairs(cur_tx_frames) do
+                        self.wal_frame_index[f.page_id] = f.offset
+                    end
+                    cur_tx_frames = {}
+                    last_committed_offset = offset + WAL.FRAME_SIZE
+                end
             else
                 break
             end
             offset = offset + WAL.FRAME_SIZE
         end
-        self.wal_indexed_size = offset
+        self.wal_indexed_size = last_committed_offset
     end
 end
 

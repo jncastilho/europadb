@@ -4,18 +4,20 @@ local serializer = {}
 local has_pack, _ = pcall(string.pack, "i", 1)
 
 function serializer.pack_uint32(n)
+    n = math.floor(tonumber(n) or 0) % 4294967296
     if has_pack then
         return string.pack(">I4", n)
     end
     local b1 = math.floor(n / 16777216) % 256
     local b2 = math.floor(n / 65536) % 256
     local b3 = math.floor(n / 256) % 256
-    local b4 = math.floor(n) % 256
+    local b4 = n % 256
     return string.char(b1, b2, b3, b4)
 end
 
 function serializer.unpack_uint32(str, pos)
     pos = pos or 1
+    if not str or pos + 3 > #str then return nil, pos end
     if has_pack then
         local val, next_pos = string.unpack(">I4", str, pos)
         return val, next_pos
@@ -52,18 +54,22 @@ end
 
 function serializer.unpack_number(str, pos)
     pos = pos or 1
+    -- Backward compatibility for .db files written by pure-Lua 5.1/5.2 fallback (uint32 len + ASCII digits)
     if pos + 3 <= #str then
         local b1, b2, b3, b4 = string.byte(str, pos, pos + 3)
         if b1 == 0 and b2 == 0 and b3 == 0 and b4 > 0 and b4 <= 32 and (pos + 3 + b4) <= #str then
             local cand = str:sub(pos + 4, pos + 3 + b4)
-            local num = tonumber(cand)
-            if num ~= nil then
-                return num, pos + 4 + b4
+            if cand:match("^[%+%-]?%d+%.?%d*[eE]?[%+%-]?%d*$") then
+                local num = tonumber(cand)
+                if num ~= nil then
+                    return num, pos + 4 + b4
+                end
             end
         end
     end
 
     if has_pack then
+        if pos + 7 > #str then return 0, pos + 8 end
         local val, next_pos = string.unpack(">d", str, pos)
         return val, next_pos
     elseif ffi_ok then
@@ -79,12 +85,13 @@ function serializer.unpack_number(str, pos)
         return double_buf[0], pos + 8
     end
     local len, next_pos = serializer.unpack_uint32(str, pos)
+    if not len then return 0, pos end
     local num_str = str:sub(next_pos, next_pos + len - 1)
     return tonumber(num_str), next_pos + len
 end
 
 -- Value Type Tags:
--- 0: NULL, 1: FALSE, 2: TRUE, 3: NUMBER, 4: STRING
+-- 0: NULL, 1: FALSE, 2: TRUE, 3: NUMBER (double), 4: STRING, 5: JSON, 6: INT64
 function serializer.pack_value(val)
     if val == nil then
         return "\x00"
@@ -93,6 +100,9 @@ function serializer.pack_value(val)
     elseif val == true then
         return "\x02"
     elseif type(val) == "number" then
+        if has_pack and math.type and math.type(val) == "integer" then
+            return "\x06" .. string.pack(">i8", val)
+        end
         return "\x03" .. serializer.pack_number(val)
     elseif type(val) == "table" then
         local json = require("europadb.sql.json")
@@ -118,6 +128,12 @@ function serializer.unpack_value(str, pos)
     elseif tag == 2 then
         return true, pos
     elseif tag == 3 then
+        return serializer.unpack_number(str, pos)
+    elseif tag == 6 then
+        if has_pack then
+            local val, next_pos = string.unpack(">i8", str, pos)
+            return val, next_pos
+        end
         return serializer.unpack_number(str, pos)
     elseif tag == 4 or tag == 5 then
         local len, next_pos = serializer.unpack_uint32(str, pos)

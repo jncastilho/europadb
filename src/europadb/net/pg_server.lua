@@ -1,3 +1,4 @@
+local serializer = require("europadb.storage.serializer")
 local pg_server = {}
 
 local ffi_ok, ffi = pcall(require, "ffi")
@@ -37,15 +38,7 @@ local function htons(n)
     return math.floor(n / 256) + (n % 256) * 256
 end
 
--- Pure Lua Big-Endian 32-bit Integer Packer (Guaranteed String Output)
-local function pack_u32(n)
-    n = math.floor(tonumber(n) or 0)
-    local b1 = math.floor(n / 16777216) % 256
-    local b2 = math.floor(n / 65536) % 256
-    local b3 = math.floor(n / 256) % 256
-    local b4 = math.floor(n) % 256
-    return string.char(b1, b2, b3, b4)
-end
+local pack_u32 = serializer.pack_uint32
 
 -- Helper to construct byte-perfect PostgreSQL Wire Protocol messages
 function pg_server.make_msg(type_char, payload)
@@ -136,6 +129,9 @@ function pg_server.start(db, port)
             if n > 0 then
                 client.buf = (client.buf or "") .. ffi.string(buf, n)
                 pg_server._process_client_stream(db, client)
+                if client.closed then
+                    clients[fd] = nil
+                end
             elseif n == 0 then
                 print("[Client Disconnected] fd=" .. fd)
                 ffi.C.close(fd)
@@ -192,6 +188,8 @@ function pg_server._process_client_stream(db, client)
     end
 
     if client.state == "STARTUP" and #pkt >= 8 then
+        local startup_len = serializer.unpack_uint32(pkt, 1) or #pkt
+        if #pkt < startup_len then return end
         print("[Startup Packet] fd=" .. fd .. " -> Sending Protocol Handshake")
         -- Send Byte-Perfect PostgreSQL Protocol Handshake
         local auth_ok    = pg_server.make_msg("R", pack_u32(0))
@@ -209,8 +207,9 @@ function pg_server._process_client_stream(db, client)
         pg_server._send_bytes(fd, auth_ok .. param_ver .. param_enc .. param_sp .. param_su .. param_auth .. param_id .. param_sc .. param_tz .. key_data .. ready)
         client.state = "READY"
         client.ready = ready
-        client.buf = ""
-        return
+        client.buf = pkt:sub(startup_len + 1)
+        pkt = client.buf
+        if #pkt == 0 then return end
     end
 
     -- Loop through all concatenated protocol messages in pkt stream
@@ -257,8 +256,10 @@ function pg_server._process_client_stream(db, client)
         elseif tag == "D" then -- Describe
             local desc_type = frame:sub(6, 6)
             if desc_type == "S" or desc_type == "P" then
-                if client.pending_sql then
-                    local ok, rows = pcall(function() return db:exec(client.pending_sql) end)
+                local first_word = client.pending_sql and client.pending_sql:match("^%s*(%w+)")
+                local is_readonly = first_word and (first_word:upper() == "SELECT" or first_word:upper() == "SHOW" or first_word:upper() == "WITH")
+                if is_readonly then
+                    local ok, rows = pcall(function() return db:exec(client.pending_sql, client.bound_params) end)
                     if ok and type(rows) == "table" and rows.message == nil then
                         local cols = {}
                         if #rows > 0 then
@@ -295,6 +296,7 @@ function pg_server._process_client_stream(db, client)
         elseif tag == "X" then -- Terminate
             print("[Terminate Connection] fd=" .. fd)
             ffi.C.close(fd)
+            client.closed = true
             break
         end
 
@@ -346,8 +348,12 @@ function pg_server._execute_and_respond(db, fd, sql, ready_suffix, client)
             for _, r in ipairs(rows) do
                 local d_parts = { string.char(math.floor(col_count / 256), col_count % 256) }
                 for _, cname in ipairs(cols) do
-                    local val_str = tostring(r[cname] ~= nil and r[cname] or "")
-                    table.insert(d_parts, pack_u32(#val_str) .. val_str)
+                    if r[cname] == nil then
+                        table.insert(d_parts, "\255\255\255\255") -- SQL NULL (-1)
+                    else
+                        local val_str = tostring(r[cname])
+                        table.insert(d_parts, pack_u32(#val_str) .. val_str)
+                    end
                 end
                 local d_str = table.concat(d_parts)
                 pg_server._send_bytes(fd, pg_server.make_msg("D", d_str))

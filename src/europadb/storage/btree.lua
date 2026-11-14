@@ -99,9 +99,10 @@ function BTree:_insert_into_node(page_id, key, row)
             for i = 1, mid do table.insert(items1, items[i]) end
             for i = mid + 1, #items do table.insert(items2, items[i]) end
 
+            local old_next = page_mgr.get_next_page(page_data)
             local new_page_id = self:_allocate_page()
-            local p1 = page_mgr.write_items(page_mgr.new_page(page_mgr.PAGE_TYPE_LEAF), items1)
-            local p2 = page_mgr.write_items(page_mgr.new_page(page_mgr.PAGE_TYPE_LEAF), items2)
+            local p1 = page_mgr.write_items(page_mgr.new_page(page_mgr.PAGE_TYPE_LEAF), items1, new_page_id)
+            local p2 = page_mgr.write_items(page_mgr.new_page(page_mgr.PAGE_TYPE_LEAF), items2, old_next)
 
             self.wal:write_page(page_id, p1)
             self.wal:write_page(new_page_id, p2)
@@ -133,8 +134,8 @@ function BTree:_insert_into_node(page_id, key, row)
                 right_child = new_child_id
             end
 
-            local test_page = page_mgr.write_interior(page_mgr.new_page(page_mgr.PAGE_TYPE_INTERIOR), keys, children, right_child)
-            if #test_page <= page_mgr.PAGE_SIZE then
+            local test_page = page_mgr.write_interior_if_fits(page_mgr.new_page(page_mgr.PAGE_TYPE_INTERIOR), keys, children, right_child)
+            if test_page then
                 self.wal:write_page(page_id, test_page)
                 return nil, nil
             else

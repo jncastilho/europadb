@@ -129,16 +129,29 @@ function page_mgr.read_interior(page_data)
 end
 
 -- Write interior page
-function page_mgr.write_interior(page_data, keys, children, right_child)
+local function _serialize_interior(keys, children, right_child)
     local page_type = page_mgr.PAGE_TYPE_INTERIOR
     local parts = { string.char(page_type), serializer.pack_uint32(#keys), serializer.pack_uint32(right_child or 0) }
     for i = 1, #keys do
         table.insert(parts, serializer.pack_value(keys[i]))
         table.insert(parts, serializer.pack_uint32(children[i] or 0))
     end
-    local body = table.concat(parts)
+    return table.concat(parts)
+end
+
+function page_mgr.write_interior(page_data, keys, children, right_child)
+    local body = _serialize_interior(keys, children, right_child)
     if #body > page_mgr.PAGE_SIZE then
         error("Interior Page payload overflow: " .. #body .. " > " .. page_mgr.PAGE_SIZE)
+    end
+    local padding = string.rep("\0", page_mgr.PAGE_SIZE - #body)
+    return body .. padding
+end
+
+function page_mgr.write_interior_if_fits(page_data, keys, children, right_child)
+    local body = _serialize_interior(keys, children, right_child)
+    if #body > page_mgr.PAGE_SIZE then
+        return nil
     end
     local padding = string.rep("\0", page_mgr.PAGE_SIZE - #body)
     return body .. padding

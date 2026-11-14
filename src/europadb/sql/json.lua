@@ -1,8 +1,13 @@
 local json = {}
 
+-- Optional fast C/Lua JSON backend detection (cjson / dkjson) with pure-Lua fallback
+local has_cjson, cjson = pcall(require, "cjson.safe")
+if not has_cjson then has_cjson, cjson = pcall(require, "cjson") end
+local has_dkjson, dkjson = pcall(require, "dkjson")
+
 -- Pure Lua JSON Encoder & Decoder
 local function escape_str(s)
-    s = s:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
+    s = s:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\b', '\\b'):gsub('\f', '\\f'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
     return '"' .. s .. '"'
 end
 
@@ -65,9 +70,23 @@ function json.parse(str)
                 local esc = str:sub(pos, pos)
                 if esc == '"' then table.insert(parts, '"')
                 elseif esc == '\\' then table.insert(parts, '\\')
+                elseif esc == '/' then table.insert(parts, '/')
+                elseif esc == 'b' then table.insert(parts, '\b')
+                elseif esc == 'f' then table.insert(parts, '\f')
                 elseif esc == 'n' then table.insert(parts, '\n')
                 elseif esc == 't' then table.insert(parts, '\t')
                 elseif esc == 'r' then table.insert(parts, '\r')
+                elseif esc == 'u' then
+                    local hex = str:sub(pos + 1, pos + 4)
+                    local code = tonumber(hex, 16)
+                    if code then
+                        if utf8 and utf8.char then
+                            table.insert(parts, utf8.char(code))
+                        elseif code < 128 then
+                            table.insert(parts, string.char(code))
+                        end
+                        pos = pos + 4
+                    end
                 else table.insert(parts, esc)
                 end
                 pos = pos + 1

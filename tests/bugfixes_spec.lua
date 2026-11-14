@@ -98,4 +98,93 @@ assert_eq(err_fk:find("FOREIGN KEY constraint failed") ~= nil, true, "FK Violati
 db2:close()
 os.remove("fk_persist.db")
 
+-- 7. Split B+Tree Page Allocation Safety Across Database Reopen
+print("\n[Bug Fix 7] Split B+Tree Page Allocation Safety Across Restart")
+local split_db_path = "split_reopen_test.db"
+os.remove(split_db_path)
+os.remove(split_db_path .. ".wal")
+os.remove(split_db_path .. ".lock")
+
+local sdb1 = luadb.open({ driver = "local", storage_path = split_db_path })
+sdb1:exec("CREATE TABLE big_split (id INT PRIMARY KEY, pad TEXT);")
+local pad_200 = string.rep("P", 200)
+sdb1:begin()
+for i = 1, 200 do
+    sdb1:exec(string.format("INSERT INTO big_split VALUES (%d, '%s');", i, pad_200))
+end
+sdb1:commit()
+sdb1:close()
+
+local sdb2 = luadb.open({ driver = "local", storage_path = split_db_path })
+sdb2:exec("CREATE TABLE second_split (id INT PRIMARY KEY, pad TEXT);")
+sdb2:begin()
+for i = 1, 100 do
+    sdb2:exec(string.format("INSERT INTO second_split VALUES (%d, '%s');", i, pad_200))
+end
+for i = 201, 300 do
+    sdb2:exec(string.format("INSERT INTO big_split VALUES (%d, '%s');", i, pad_200))
+end
+sdb2:commit()
+
+local cnt_big = sdb2:exec("SELECT COUNT(*) AS c FROM big_split;")
+local cnt_sec = sdb2:exec("SELECT COUNT(*) AS c FROM second_split;")
+assert_eq(cnt_big[1].c, 300, "big_split preserved all 300 rows across reopen + split")
+assert_eq(cnt_sec[1].c, 100, "second_split preserved all 100 rows")
+sdb2:close()
+os.remove(split_db_path)
+os.remove(split_db_path .. ".wal")
+os.remove(split_db_path .. ".lock")
+
+-- 8. SQL Edge Cases: LIKE Metacharacters, CTE Outer WHERE, JOIN, Precedence, UPDATE Negatives & String Literals
+print("\n[Bug Fix 8] SQL Edge Cases (LIKE, CTE WHERE, JOIN, AND/OR Precedence, UPDATE, String Literals)")
+local edb = luadb.open({ driver = "memory", storage_path = "edge_cases.db" })
+edb:exec("CREATE TABLE edge_t (id INT PRIMARY KEY, a INT, b INT, tag TEXT);")
+edb:exec("INSERT INTO edge_t VALUES (1, 10, 100, 'NULL');")
+edb:exec("INSERT INTO edge_t VALUES (2, 20, 200, 'true');")
+edb:exec("INSERT INTO edge_t VALUES (3, 30, 300, '(special).val');")
+
+-- String literals 'NULL' and 'true' must remain strings
+local r_lit = edb:exec("SELECT * FROM edge_t ORDER BY id ASC;")
+assert_eq(r_lit[1].tag, "NULL", "String literal 'NULL' preserved as string")
+assert_eq(r_lit[2].tag, "true", "String literal 'true' preserved as string")
+
+-- LIKE with regex metacharacters '(' and '.'
+local r_like_paren = edb:exec("SELECT * FROM edge_t WHERE tag LIKE '(%';")
+assert_eq(#r_like_paren, 1, "LIKE with '(' metacharacter does not crash and matches 1 row")
+local r_like_dot = edb:exec("SELECT * FROM edge_t WHERE tag LIKE 'n.ll';")
+assert_eq(#r_like_dot, 0, "LIKE '.' is escaped as literal dot, not wildcard")
+
+-- CTE with outer WHERE and projection
+local r_cte = edb:exec("WITH sub AS (SELECT id, tag FROM edge_t) SELECT tag FROM sub WHERE id = 2;")
+assert_eq(#r_cte, 1, "CTE outer WHERE filtered to 1 row")
+assert_eq(r_cte[1].tag, "true", "CTE outer projection returned expected column")
+
+-- UPDATE cross-column arithmetic and negative numbers
+edb:exec("UPDATE edge_t SET a = b + 5 WHERE id = 1;")
+edb:exec("UPDATE edge_t SET b = -42 WHERE id = 2;")
+local r_upd = edb:exec("SELECT * FROM edge_t ORDER BY id ASC;")
+assert_eq(r_upd[1].a, 105, "UPDATE cross-column SET a = b + 5")
+assert_eq(r_upd[2].b, -42, "UPDATE negative number SET b = -42")
+
+-- Boolean operator precedence: AND binds tighter than OR
+local r_prec = edb:exec("SELECT * FROM edge_t WHERE id = 1 AND a = 999 OR id = 2;")
+assert_eq(#r_prec, 1, "WHERE A AND B OR C evaluates as (A AND B) OR C")
+assert_eq(r_prec[1].id, 2, "Precedence matched id = 2")
+
+-- INNER JOIN
+edb:exec("CREATE TABLE orders_t (oid INT PRIMARY KEY, uid INT, item TEXT);")
+edb:exec("INSERT INTO orders_t VALUES (10, 1, 'Keyboard');")
+local r_join = edb:exec("SELECT * FROM edge_t JOIN orders_t ON edge_t.id = orders_t.uid;")
+assert_eq(#r_join, 1, "INNER JOIN matched 1 row")
+assert_eq(r_join[1].item, "Keyboard", "INNER JOIN projected joined column")
+
+-- REINDEX inside active transaction preserves uncommitted rows
+edb:begin()
+edb:exec("INSERT INTO edge_t VALUES (4, 40, 400, 'in_tx');")
+edb:exec("REINDEX;")
+edb:commit()
+local r_reidx = edb:exec("SELECT * FROM edge_t WHERE id = 4;")
+assert_eq(#r_reidx, 1, "REINDEX inside transaction preserved uncommitted row")
+edb:close()
+
 print("\n[PASS] Comprehensive Bug Fixes Suite Passed 100%!")

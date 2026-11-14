@@ -5,15 +5,17 @@ package.path = "src/?.lua;src/?/init.lua;" .. package.path
 local europadb = require("europadb")
 local pg_server = require("europadb.net.pg_server")
 
-local db_path = arg[1] or "app.edb"
+local is_legacy_luadb = (_G._LUADB_SERVER_MODE == true)
+local db_path = arg[1] or (is_legacy_luadb and "app.db" or "app.edb")
 local port = tonumber(arg[2]) or 5433
 
 local db = europadb.open({ driver = "local", storage_path = db_path })
 
 -- Auto-seed sample demo data if catalog is empty
 if not db.executor.catalog["demo"] then
+    local welcome = is_legacy_luadb and "Welcome to LuaDB" or "Welcome to EuropaDB"
     db:exec("CREATE TABLE IF NOT EXISTS demo (id INT PRIMARY KEY, title TEXT, category TEXT);")
-    db:exec("INSERT INTO demo VALUES (1, 'Welcome to EuropaDB', 'General');")
+    db:exec("INSERT INTO demo VALUES (1, '" .. welcome .. "', 'General');")
     db:exec("INSERT INTO demo VALUES (2, 'PostgreSQL Wire Protocol Gateway', 'Network');")
     db:exec("INSERT INTO demo VALUES (3, 'Pure Lua B+Tree Storage Engine', 'Database');")
 end
