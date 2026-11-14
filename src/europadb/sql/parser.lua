@@ -100,17 +100,12 @@ function parser._parse_tokens(tokens, sql, params)
         return val
     end
 
-    local function parse_expression()
+    local parse_expression
+
+    local function parse_primary()
         if match_symbol("(") then
             local expr = parse_expression()
             if not match_symbol(")") then error("Expected ')' after parenthesized expression") end
-            if match_keyword("AND") then
-                local next_expr = parse_expression()
-                return { type = "AND", left = expr, right = next_expr }
-            elseif match_keyword("OR") then
-                local next_expr = parse_expression()
-                return { type = "OR", left = expr, right = next_expr }
-            end
             return expr
         end
 
@@ -133,15 +128,7 @@ function parser._parse_tokens(tokens, sql, params)
         if match_keyword("IS") then
             local is_not = match_keyword("NOT")
             if match_keyword("NULL") then
-                local expr = { left = left_node, op = is_not and "IS NOT NULL" or "IS NULL", right = nil }
-                if match_keyword("AND") then
-                    local next_expr = parse_expression()
-                    return { type = "AND", left = expr, right = next_expr }
-                elseif match_keyword("OR") then
-                    local next_expr = parse_expression()
-                    return { type = "OR", left = expr, right = next_expr }
-                end
-                return expr
+                return { left = left_node, op = is_not and "IS NOT NULL" or "IS NULL", right = nil }
             end
         end
 
@@ -160,15 +147,7 @@ function parser._parse_tokens(tokens, sql, params)
                 if not match_symbol(",") then break end
             until false
             if not match_symbol(")") then error("Expected ')' after IN list") end
-            local expr = { left = left_node, op = "IN", right = in_vals }
-            if match_keyword("AND") then
-                local next_expr = parse_expression()
-                return { type = "AND", left = expr, right = next_expr }
-            elseif match_keyword("OR") then
-                local next_expr = parse_expression()
-                return { type = "OR", left = expr, right = next_expr }
-            end
-            return expr
+            return { left = left_node, op = "IN", right = in_vals }
         end
 
         local op_token = consume()
@@ -177,23 +156,47 @@ function parser._parse_tokens(tokens, sql, params)
         end
 
         local val_token = consume()
+        if val_token and val_token.type == "SYMBOL" and val_token.value == "-" then
+            local next_v = consume()
+            if next_v and next_v.type == "NUMBER" then
+                val_token = { type = "NUMBER", value = -next_v.value }
+            end
+        end
         if not val_token then error("Expected literal value in expression") end
-
-        local expr = {
-            left = left_node,
-            op = op_token.value:upper(),
-            right = val_token.value
-        }
-
-        if match_keyword("AND") then
-            local next_expr = parse_expression()
-            return { type = "AND", left = expr, right = next_expr }
-        elseif match_keyword("OR") then
-            local next_expr = parse_expression()
-            return { type = "OR", left = expr, right = next_expr }
+        if val_token.type == "SYMBOL" and val_token.value == "." and peek() then
+            -- Already handled by expect_identifier when right side is column ref
+        elseif peek() and peek().type == "SYMBOL" and peek().value == "." then
+            consume()
+            local rhs_sub = consume()
+            if rhs_sub then
+                val_token = { type = "IDENTIFIER", value = tostring(val_token.value) .. "." .. tostring(rhs_sub.value) }
+            end
         end
 
-        return expr
+        return {
+            left = left_node,
+            op = op_token.value:upper(),
+            right = val_token.value,
+            right_type = val_token.type
+        }
+    end
+
+    local function parse_and()
+        local left = parse_primary()
+        while match_keyword("AND") do
+            local right = parse_primary()
+            left = { type = "AND", left = left, right = right }
+        end
+        return left
+    end
+
+    parse_expression = function()
+        local left = parse_and()
+        while match_keyword("OR") do
+            local right = parse_and()
+            left = { type = "OR", left = left, right = right }
+        end
+        return left
     end
 
     -- ALTER TABLE
@@ -255,9 +258,11 @@ function parser._parse_tokens(tokens, sql, params)
     -- 1. CREATE TABLE / CREATE INDEX
     if match_keyword("CREATE") then
         if match_keyword("TABLE") then
+            local if_not_exists = false
             if match_keyword("IF") then
                 match_keyword("NOT")
                 match_keyword("EXISTS")
+                if_not_exists = true
             end
             local table_name = expect_identifier()
             if not match_symbol("(") then error("Expected '(' after table name") end
@@ -335,7 +340,7 @@ function parser._parse_tokens(tokens, sql, params)
             if not closed then error("Expected ')' after column definitions") end
 
             match_symbol(";")
-            return { command = "CREATE_TABLE", table = table_name, columns = columns, foreign_keys = foreign_keys }
+            return { command = "CREATE_TABLE", table = table_name, columns = columns, foreign_keys = foreign_keys, if_not_exists = if_not_exists }
 
         elseif match_keyword("INDEX") then
             local idx_name = expect_identifier()
@@ -408,10 +413,12 @@ function parser._parse_tokens(tokens, sql, params)
             end
             val_idx = val_idx + 1
             local val_to_store = v.value
-            local str_val = tostring(v.value):upper()
-            if str_val == "TRUE" then val_to_store = true
-            elseif str_val == "FALSE" then val_to_store = false
-            elseif str_val == "NULL" then val_to_store = nil end
+            if v.type == "KEYWORD" or v.type == "BOOLEAN" then
+                local str_val = tostring(v.value):upper()
+                if str_val == "TRUE" then val_to_store = true
+                elseif str_val == "FALSE" then val_to_store = false
+                elseif str_val == "NULL" then val_to_store = nil end
+            end
             values[val_idx] = val_to_store  -- Direct index preserves nil holes
             if not match_symbol(",") then break end
         until false
@@ -508,27 +515,41 @@ function parser._parse_tokens(tokens, sql, params)
         end
 
         local table_name = nil
+        local table_alias = nil
         if match_keyword("FROM") then
             table_name = expect_identifier()
             local alias_tok = peek()
-            if alias_tok and alias_tok.type == "IDENTIFIER" and alias_tok.value:upper() ~= "WHERE" and alias_tok.value:upper() ~= "JOIN" and alias_tok.value:upper() ~= "ORDER" and alias_tok.value:upper() ~= "LIMIT" then
-                consume() -- consume table alias
+            if alias_tok and alias_tok.type == "IDENTIFIER" and alias_tok.value:upper() ~= "WHERE" and alias_tok.value:upper() ~= "JOIN" and alias_tok.value:upper() ~= "INNER" and alias_tok.value:upper() ~= "LEFT" and alias_tok.value:upper() ~= "GROUP" and alias_tok.value:upper() ~= "ORDER" and alias_tok.value:upper() ~= "LIMIT" then
+                table_alias = consume().value
             end
         end
 
         local join_clause = nil
         repeat
-            if match_keyword("JOIN") or match_keyword("INNER") or match_keyword("LEFT") then
+            local join_type = nil
+            if match_keyword("LEFT") then
+                join_type = "LEFT"
                 match_keyword("OUTER")
                 match_keyword("JOIN")
+            elseif match_keyword("INNER") then
+                join_type = "INNER"
+                match_keyword("JOIN")
+            elseif match_keyword("JOIN") then
+                join_type = "INNER"
+            end
+            if join_type then
                 local join_table = expect_identifier()
+                local j_alias = nil
                 local j_alias_tok = peek()
-                if j_alias_tok and j_alias_tok.type == "IDENTIFIER" and j_alias_tok.value:upper() ~= "ON" then
-                    consume() -- consume join table alias
+                if j_alias_tok and j_alias_tok.type == "IDENTIFIER" and j_alias_tok.value:upper() ~= "ON" and j_alias_tok.value:upper() ~= "WHERE" then
+                    j_alias = consume().value
                 end
+                local join_cond = nil
                 if match_keyword("ON") then
-                    pcall(parse_expression)
+                    local ok_c, c_expr = pcall(parse_expression)
+                    if ok_c then join_cond = c_expr end
                 end
+                join_clause = { type = join_type, table = join_table, alias = j_alias, condition = join_cond }
             else
                 break
             end
@@ -540,6 +561,7 @@ function parser._parse_tokens(tokens, sql, params)
         end
 
         local group_by = nil
+        local having_clause = nil
         if match_keyword("GROUP") then
             if match_keyword("BY") then
                 local cols = {}
@@ -549,9 +571,11 @@ function parser._parse_tokens(tokens, sql, params)
                     if not match_symbol(",") then break end
                 until false
                 group_by = cols
-                match_keyword("HAVING") -- optional HAVING clause: consume keyword then expression
-                if peek() and peek().value ~= ";" and peek().value:upper() ~= "ORDER" and peek().value:upper() ~= "LIMIT" then
-                    pcall(parse_expression)
+                if match_keyword("HAVING") then
+                    if peek() and peek().value ~= ";" and peek().value:upper() ~= "ORDER" and peek().value:upper() ~= "LIMIT" then
+                        local ok_h, h_expr = pcall(parse_expression)
+                        if ok_h then having_clause = h_expr end
+                    end
                 end
             end
         end
@@ -597,9 +621,11 @@ function parser._parse_tokens(tokens, sql, params)
             command = "SELECT",
             projections = projections,
             table = table_name,
+            table_alias = table_alias,
             join = join_clause,
             where = where_clause,
             group_by = group_by,
+            having = having_clause,
             order_by = order_by,
             limit = limit,
             offset = offset
@@ -617,17 +643,35 @@ function parser._parse_tokens(tokens, sql, params)
             local eq = consume()
             if not eq or (eq.type ~= "OPERATOR" and eq.value ~= "=") then error("Expected '=' in SET") end
             local left_tok = consume()
+            if left_tok and left_tok.type == "SYMBOL" and left_tok.value == "-" then
+                local next_v = consume()
+                if next_v and next_v.type == "NUMBER" then
+                    left_tok = { type = "NUMBER", value = -next_v.value }
+                end
+            end
+            if not left_tok then error("Expected value in SET assignment") end
             local op_tok = peek()
             if op_tok and op_tok.type == "SYMBOL" and (op_tok.value == "+" or op_tok.value == "-") then
                 local op = consume().value
                 local right_tok = consume()
+                if right_tok and right_tok.type == "SYMBOL" and right_tok.value == "-" then
+                    local next_rv = consume()
+                    if next_rv and next_rv.type == "NUMBER" then
+                        right_tok = { type = "NUMBER", value = -next_rv.value }
+                    end
+                end
                 table.insert(set_assignments, {
                     column = col,
-                    expr = { left = left_tok.value, op = op, right = right_tok.value }
+                    expr = { left = left_tok.value, op = op, right = right_tok and right_tok.value or 0 }
                 })
             else
                 local val_to_store = left_tok.value
-                if left_tok.type == "KEYWORD" and left_tok.value:upper() == "NULL" then val_to_store = nil end
+                if left_tok.type == "KEYWORD" or left_tok.type == "BOOLEAN" then
+                    local u = tostring(left_tok.value):upper()
+                    if u == "NULL" then val_to_store = nil
+                    elseif u == "TRUE" then val_to_store = true
+                    elseif u == "FALSE" then val_to_store = false end
+                end
                 table.insert(set_assignments, { column = col, value = val_to_store })
             end
             if not match_symbol(",") then break end

@@ -61,7 +61,9 @@ local function _sleep_ms(ms)
 end
 
 local function _is_pid_alive(pid)
-    if not pid or pid == 0 then return false end
+    pid = tonumber(pid)
+    if not pid or pid <= 0 then return false end
+    pid = math.floor(pid)
     local f = io.open("/proc/" .. pid .. "/stat", "r")
     if f then
         f:close()
@@ -78,9 +80,16 @@ function LocalVFS.new(config)
     return self
 end
 
+local function _resolve_path(base_dir, filename)
+    if filename:sub(1, 1) == "/" or base_dir == "." or base_dir == "" then
+        return filename
+    end
+    return base_dir .. "/" .. filename
+end
+
 function LocalVFS:open(filename, mode, options)
     mode = mode or "r+b"
-    local full_path = self.base_dir .. "/" .. filename
+    local full_path = _resolve_path(self.base_dir, filename)
     local is_wal = filename:sub(-4) == ".wal"
     local no_lock = options and options.no_lock
 
@@ -248,7 +257,7 @@ function LocalVFS:open(filename, mode, options)
 end
 
 function LocalVFS:exists(filename)
-    local full_path = self.base_dir .. "/" .. filename
+    local full_path = _resolve_path(self.base_dir, filename)
     local f = io.open(full_path, "rb")
     if f then
         f:close()
@@ -258,7 +267,7 @@ function LocalVFS:exists(filename)
 end
 
 function LocalVFS:delete(filename)
-    local full_path = self.base_dir .. "/" .. filename
+    local full_path = _resolve_path(self.base_dir, filename)
     if LocalVFS._active_locks[full_path] then
         local obj = LocalVFS._active_locks[full_path]
         if obj.lock_handle then

@@ -4,16 +4,22 @@ package.path = "src/?.lua;src/?/init.lua;" .. package.path
 
 local europadb = require("europadb")
 
-local db_path = arg[1] or "app.edb"
+local is_legacy_luadb = (_G._LUADB_CLI_MODE == true)
+local default_db = is_legacy_luadb and "app.db" or "app.edb"
+local mem_db = is_legacy_luadb and "memory.db" or "memory.edb"
+local banner_title = is_legacy_luadb and "  LuaDB Interactive CLI (v1.0.0)" or "  EuropaDB Interactive CLI (v2.0.0-europa)"
+local prompt_str = is_legacy_luadb and "luadb=> " or "europa=> "
+
+local db_path = arg[1] or default_db
 local driver = "local"
 
 if db_path == ":memory:" or db_path == "memory" then
     driver = "memory"
-    db_path = "memory.edb"
+    db_path = mem_db
 end
 
 print("=========================================================")
-print("  EuropaDB Interactive CLI (v2.0.0-europa)")
+print(banner_title)
 print("  Connected to " .. driver .. " database: [" .. db_path .. "]")
 print("  Type '\\dt' to list tables, '\\d <table>' for schema, '\\q' to quit.")
 print("  Press Ctrl+D or type '\\q' anytime to exit.")
@@ -130,7 +136,7 @@ end
 local running = true
 
 while running do
-    io.write("europa=> ")
+    io.write(prompt_str)
     io.flush()
     local line = io.read("*line")
     
@@ -142,6 +148,7 @@ while running do
 
     line = line:gsub("^%s*(.-)%s*$", "%1")
     line = line:gsub("^lua%s+bin/europadb_cli%.lua%s*[^%s]*%s*", "")
+    line = line:gsub("^lua%s+bin/luadb_cli%.lua%s*[^%s]*%s*", "")
     line = line:gsub("^lua%s+", "")
 
     if #line > 0 then

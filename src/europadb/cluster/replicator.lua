@@ -37,19 +37,27 @@ local O_NONBLOCK = 2048
 
 local function extract_mutation_meta(db, sql)
     if not sql or not db or not db.executor then return nil, nil end
-    local ok, parser = pcall(require, "luadb.sql.parser")
+    local ok, parser = pcall(require, "europadb.sql.parser")
     if not ok or not parser then return nil, nil end
 
     local ok_p, ast = pcall(parser.parse, sql)
     if not ok_p or not ast or not ast.table then return nil, nil end
 
     local table_name = ast.table
-    local meta = db.executor.catalog and db.executor.catalog[table_name:lower()]
+    local meta = nil
+    if db.executor.catalog then
+        meta = db.executor.catalog[table_name] or db.executor.catalog[table_name:lower()]
+        if not meta then
+            for k, v in pairs(db.executor.catalog) do
+                if k:lower() == table_name:lower() then meta = v break end
+            end
+        end
+    end
     if not meta then return table_name, nil end
 
     local pk_col_name, pk_col_idx = nil, nil
     for idx, col in ipairs(meta.columns) do
-        if col.is_pk then
+        if col.primary_key or col.is_pk then
             pk_col_name = col.name
             pk_col_idx = idx
             break

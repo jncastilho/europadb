@@ -1,9 +1,51 @@
 local aws_sigv4 = {}
 
--- Bitwise operations fallback for Lua versions (Lua 5.1/5.2/5.3/5.4/LuaJIT)
+-- Bitwise operations fallback for Lua versions (Lua 5.3+/5.4/5.5 native ops, Lua 5.2 bit32, LuaJIT bit, or Lua 5.1 fallback)
 local bit = _G.bit32 or _G.bit
 if not bit then
-    -- Pure Lua bitwise fallback if no bit module exists
+    local load_fn = loadstring or load
+    local ok_native, native_bit = pcall(function()
+        local chunk = load_fn([[
+            local M = {}
+            function M.band(a, b, c)
+                local r = (a & b) & 0xFFFFFFFF
+                if c then r = (r & c) & 0xFFFFFFFF end
+                return r
+            end
+            function M.bor(a, b, c)
+                local r = (a | b) & 0xFFFFFFFF
+                if c then r = (r | c) & 0xFFFFFFFF end
+                return r
+            end
+            function M.bxor(a, b, c)
+                local r = (a ~ b) & 0xFFFFFFFF
+                if c then r = (r ~ c) & 0xFFFFFFFF end
+                return r
+            end
+            function M.bnot(a)
+                return (~a) & 0xFFFFFFFF
+            end
+            function M.rshift(a, n)
+                return ((a & 0xFFFFFFFF) >> n) & 0xFFFFFFFF
+            end
+            function M.lshift(a, n)
+                return ((a & 0xFFFFFFFF) << n) & 0xFFFFFFFF
+            end
+            function M.ror(a, n)
+                n = n & 31
+                a = a & 0xFFFFFFFF
+                return ((a >> n) | (a << (32 - n))) & 0xFFFFFFFF
+            end
+            return M
+        ]])
+        return chunk and chunk()
+    end)
+    if ok_native and native_bit then
+        bit = native_bit
+    end
+end
+if not bit then
+    -- Pure Lua 5.1 bitwise fallback if no native bit operators or bit module exist
     bit = {}
     local math_floor = math.floor
 
@@ -26,7 +68,7 @@ if not bit then
         return n
     end
 
-    function bit.bxor(a, b)
+    local function bxor2(a, b)
         local ta = to_bits(a, 32)
         local tb = to_bits(b, 32)
         local res = {}
@@ -36,7 +78,13 @@ if not bit then
         return from_bits(res)
     end
 
-    function bit.band(a, b)
+    function bit.bxor(a, b, c)
+        local r = bxor2(a, b)
+        if c then r = bxor2(r, c) end
+        return r
+    end
+
+    local function band2(a, b)
         local ta = to_bits(a, 32)
         local tb = to_bits(b, 32)
         local res = {}
@@ -44,6 +92,12 @@ if not bit then
             res[i] = (ta[i] == 1 and tb[i] == 1) and 1 or 0
         end
         return from_bits(res)
+    end
+
+    function bit.band(a, b, c)
+        local r = band2(a, b)
+        if c then r = band2(r, c) end
+        return r
     end
 
     function bit.bnot(a)

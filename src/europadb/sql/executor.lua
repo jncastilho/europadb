@@ -47,10 +47,6 @@ function executor:_btree(root_id)
 end
 
 function executor:reindex(target)
-    if self.wal and self.wal.recover then
-        pcall(function() self.wal:recover() end)
-    end
-
     local count = 0
     local norm_target = target and (target:match("([^%.]+)$") or target)
     for idx_name, idx_meta in pairs(self.indexes) do
@@ -174,6 +170,25 @@ function executor:_load_catalog()
                 end
             end
         end
+        -- Ensure next_page_id is past all physical pages on disk and in WAL
+        if self.wal then
+            if self.wal.file and self.wal.file.size then
+                local ok_s, fsize = pcall(function() return self.wal.file:size() end)
+                if ok_s and fsize and fsize > 0 then
+                    local max_disk_pid = math.floor(fsize / page_mgr.PAGE_SIZE)
+                    if max_disk_pid >= self.next_page_id then
+                        self.next_page_id = max_disk_pid + 1
+                    end
+                end
+            end
+            if self.wal.wal_index then
+                for pid, _ in pairs(self.wal.wal_index) do
+                    if type(pid) == "number" and pid >= self.next_page_id then
+                        self.next_page_id = pid + 1
+                    end
+                end
+            end
+        end
     end
 end
 
@@ -247,6 +262,15 @@ function executor:execute(ast)
 
     -- Execute CTE if present
     local cte_backup = nil
+    local function cleanup_cte()
+        if ast.cte then
+            if cte_backup then
+                self.catalog[ast.cte.name] = cte_backup
+            else
+                self.catalog[ast.cte.name] = nil
+            end
+        end
+    end
     if ast.cte then
         if self.catalog[ast.cte.name] then
             cte_backup = self.catalog[ast.cte.name]
@@ -254,13 +278,38 @@ function executor:execute(ast)
         local cte_res = self:execute(ast.cte.ast)
         if cte_res then
             local cte_cols = {}
+            local col_seen = {}
+            if ast.cte.ast and ast.cte.ast.projections then
+                for _, p in ipairs(ast.cte.ast.projections) do
+                    local cname = p.alias or (p.type == "AGGREGATE" and (p.func:lower() .. "_" .. (p.column == "*" and "star" or p.column))) or p.column
+                    if cname and cname ~= "*" and not col_seen[cname] then
+                        col_seen[cname] = true
+                        table.insert(cte_cols, { name = cname, type = "TEXT" })
+                    end
+                end
+            end
             if #cte_res > 0 then
-                for k, _ in pairs(cte_res[1]) do table.insert(cte_cols, { name = k, type = "TEXT" }) end
+                local extra_keys = {}
+                for k, _ in pairs(cte_res[1]) do
+                    if not col_seen[k] then table.insert(extra_keys, k) end
+                end
+                table.sort(extra_keys)
+                for _, k in ipairs(extra_keys) do
+                    table.insert(cte_cols, { name = k, type = "TEXT" })
+                end
+            end
+            local cte_tuples = {}
+            for _, rec in ipairs(cte_res) do
+                local tup = { n = #cte_cols }
+                for idx, c in ipairs(cte_cols) do
+                    tup[idx] = rec[c.name]
+                end
+                table.insert(cte_tuples, tup)
             end
             self.catalog[ast.cte.name] = {
                 root_page_id = 99999,
                 columns = cte_cols,
-                transient_rows = cte_res,
+                transient_rows = cte_tuples,
                 indexes = {}
             }
         end
@@ -288,8 +337,10 @@ function executor:execute(ast)
 
     elseif cmd == "CREATE_TABLE" then
         if self.catalog[ast.table] then
-            self.catalog[ast.table].columns = ast.columns or self.catalog[ast.table].columns
-            self:_save_catalog()
+            if not ast.if_not_exists then
+                self.catalog[ast.table].columns = ast.columns or self.catalog[ast.table].columns
+                self:_save_catalog()
+            end
             return { message = "Table created: " .. ast.table }
         end
         local root_id = self:_allocate_page()
@@ -518,19 +569,10 @@ function executor:execute(ast)
 
         local clean_table = ast.table and ast.table:match("([^%.]+)$") or ast.table
         local meta = self.catalog[ast.table] or self.catalog[clean_table]
-        if meta and meta.transient_rows then
-            local t_rows = meta.transient_rows
-            if ast.cte then
-                if cte_backup then
-                    self.catalog[ast.cte.name] = cte_backup
-                else
-                    self.catalog[ast.cte.name] = nil
-                end
-            end
-            return t_rows
-        end
 
-        if ast.table and (ast.table:lower():find("pg_") or ast.table:lower():find("unnest")) then
+        local clean_lower = (clean_table or ""):lower()
+        local raw_lower = (ast.table or ""):lower()
+        if not meta and ast.table and (clean_lower:match("^pg_") or raw_lower:match("^pg_catalog%.") or clean_lower:match("^unnest")) then
             local tbl_lower = ast.table:lower()
             local raw_catalog_rows = {}
             if tbl_lower:find("unnest") then
@@ -705,60 +747,81 @@ function executor:execute(ast)
                 end
                 table.insert(projected, rec)
             end
+            cleanup_cte()
             return projected
         end
 
-        local clean_table = ast.table and ast.table:match("([^%.]+)$") or ast.table
-        local meta = self.catalog[ast.table] or self.catalog[clean_table]
-        if meta and meta.transient_rows then
-            local t_rows = meta.transient_rows
-            if ast.cte then
-                if cte_backup then
-                    self.catalog[ast.cte.name] = cte_backup
-                else
-                    self.catalog[ast.cte.name] = nil
-                end
-            end
-            return t_rows
-        end
         if not meta then
             local tbl_lower = (ast.table or ""):lower()
             if tbl_lower:find("current_schema") or tbl_lower:find("version") then
+                cleanup_cte()
                 return { { current_schema = "public", version = "PostgreSQL 14.0 (LuaDB)" } }
             end
+            cleanup_cte()
             return nil, "Table not found: " .. ast.table
         end
 
-        local btree = self:_btree(meta.root_page_id)
-        local raw_rows = btree:scan()
+        local raw_rows
+        if meta.transient_rows then
+            raw_rows = meta.transient_rows
+        else
+            local btree = self:_btree(meta.root_page_id)
+            raw_rows = btree:scan()
+        end
 
         -- Handle JOINs
         if ast.join then
-            local j_meta = self.catalog[ast.join.table]
+            local j_clean = ast.join.table and ast.join.table:match("([^%.]+)$") or ast.join.table
+            local j_meta = self.catalog[ast.join.table] or self.catalog[j_clean]
             if j_meta then
-                local j_tree = self:_btree(j_meta.root_page_id)
-                local j_rows = j_tree:scan()
+                local j_rows = j_meta.transient_rows or self:_btree(j_meta.root_page_id):scan()
                 local combined = {}
+                local left_prefix = (ast.table_alias or clean_table):lower()
+                local right_prefix = (ast.join.alias or j_clean):lower()
+                local combined_cols = {}
+                for _, c in ipairs(meta.columns) do
+                    table.insert(combined_cols, {
+                        name = c.name,
+                        alt = left_prefix .. "." .. c.name:lower(),
+                        full_alt = clean_table:lower() .. "." .. c.name:lower(),
+                        type = c.type
+                    })
+                end
+                for _, c in ipairs(j_meta.columns) do
+                    table.insert(combined_cols, {
+                        name = c.name,
+                        alt = right_prefix .. "." .. c.name:lower(),
+                        full_alt = j_clean:lower() .. "." .. c.name:lower(),
+                        type = c.type
+                    })
+                end
 
+                local left_len = #meta.columns
+                local right_len = #j_meta.columns
                 for _, r1 in ipairs(raw_rows) do
                     local matched = false
                     for _, r2 in ipairs(j_rows) do
-                        local combined_row = {}
-                        for _, v in ipairs(r1) do table.insert(combined_row, v) end
-                        for _, v in ipairs(r2) do table.insert(combined_row, v) end
+                        local combined_row = { n = left_len + right_len }
+                        for i = 1, left_len do combined_row[i] = r1[i] end
+                        for i = 1, right_len do combined_row[left_len + i] = r2[i] end
 
-                        -- Merge column definitions
-                        local combined_cols = {}
-                        for _, c in ipairs(meta.columns) do table.insert(combined_cols, { name = meta.root_page_id .. "." .. c.name, alt = c.name }) end
-                        for _, c in ipairs(j_meta.columns) do table.insert(combined_cols, { name = j_meta.root_page_id .. "." .. c.name, alt = c.name }) end
-
-                        if self:_eval_where(ast.join.condition, combined_row, combined_cols) then
+                        if not ast.join.condition or self:_eval_where(ast.join.condition, combined_row, combined_cols) then
                             table.insert(combined, combined_row)
                             matched = true
                         end
                     end
+                    if not matched and ast.join.type == "LEFT" then
+                        local combined_row = { n = left_len + right_len }
+                        for i = 1, left_len do combined_row[i] = r1[i] end
+                        table.insert(combined, combined_row)
+                    end
                 end
                 raw_rows = combined
+                meta = {
+                    root_page_id = meta.root_page_id,
+                    columns = combined_cols,
+                    indexes = {}
+                }
             end
         end
 
@@ -918,6 +981,7 @@ function executor:execute(ast)
                 for i = start_g, math.min(end_g, #filtered) do table.insert(limited, filtered[i]) end
                 filtered = limited
             end
+            cleanup_cte()
             return filtered
         end
 
@@ -973,6 +1037,7 @@ function executor:execute(ast)
                 local key_name = proj.alias or (func:lower() .. "_" .. (col_name == "*" and "star" or col_name))
                 agg_record[key_name] = res_val
             end
+            cleanup_cte()
             return { agg_record }
         end
 
@@ -991,6 +1056,7 @@ function executor:execute(ast)
                 local cname = ob.column:lower()
                 local cnum = tonumber(cname)
                 if not cnum and not col_idx_map[cname] then
+                    cleanup_cte()
                     return nil, "Column not found: " .. ob.column
                 end
             end
@@ -1092,13 +1158,7 @@ function executor:execute(ast)
         end
 
         -- Clean up transient CTE tables after query evaluation
-        if ast.cte then
-            if cte_backup then
-                self.catalog[ast.cte.name] = cte_backup
-            else
-                self.catalog[ast.cte.name] = nil
-            end
-        end
+        cleanup_cte()
 
         return final_rows
 
@@ -1116,11 +1176,21 @@ function executor:execute(ast)
             local row = item.row
             if not ast.where or self:_eval_where(ast.where, row, meta.columns) then
                 table.insert(affected_pks, key)
+                local old_row = {}
+                for i = 1, #meta.columns do old_row[i] = row[i] end
                 for _, assign in ipairs(ast.assignments) do
                     for idx, col in ipairs(meta.columns) do
                         if col.name:lower() == assign.column:lower() then
                             if assign.expr then
-                                local cur_v = row[idx] or 0
+                                local lhs_val = nil
+                                local lhs_name = tostring(assign.expr.left or ""):lower()
+                                for c_i, c_def in ipairs(meta.columns) do
+                                    if c_def.name:lower() == lhs_name then
+                                        lhs_val = old_row[c_i]
+                                        break
+                                    end
+                                end
+                                local cur_v = (lhs_val ~= nil and tonumber(lhs_val)) or tonumber(assign.expr.left) or old_row[idx] or 0
                                 local r_v = tonumber(assign.expr.right) or 0
                                 if assign.expr.op == "+" then
                                     row[idx] = cur_v + r_v
@@ -1133,15 +1203,20 @@ function executor:execute(ast)
                         end
                     end
                 end
+                row.n = #meta.columns
                 btree:insert(key, row)
 
-                -- Update secondary indexes
+                -- Update secondary indexes (remove old key if changed, insert new key)
                 for idx_name, idx_meta in pairs(self.indexes) do
                     if idx_meta.table_name:lower() == ast.table:lower() then
                         local idx_tree = self:_btree(idx_meta.root_page_id)
                         for c_idx, col in ipairs(meta.columns) do
                             if col.name:lower() == idx_meta.column_name:lower() then
+                                local old_val = old_row[c_idx]
                                 local col_val = row[c_idx]
+                                if old_val ~= nil and old_val ~= col_val then
+                                    idx_tree:delete(old_val)
+                                end
                                 if col_val ~= nil then idx_tree:insert(col_val, { key }) end
                             end
                         end
@@ -1253,40 +1328,46 @@ end
 function executor:_eval_where(where, row, columns)
     if not where then return true end
     if where.op then
-        local val = nil
-        if type(where.left) == "table" and where.left.type == "JSON_EXTRACT" then
-            local json = require("europadb.sql.json")
-            local raw_json = nil
+        local function resolve_col(col_ref)
+            local ref_lower = tostring(col_ref):lower()
+            local ref_short = ref_lower:match("([^%.]+)$") or ref_lower
             if columns then
                 for idx, col in ipairs(columns) do
-                    if (col.name or col.alt):lower() == tostring(where.left.column):lower() then
-                        raw_json = row[idx]
-                        break
+                    local cname = (col.name or ""):lower()
+                    local calt = (col.alt or ""):lower()
+                    local cfull = (col.full_alt or ""):lower()
+                    if ref_lower == cname or ref_lower == calt or ref_lower == cfull then
+                        return row[idx], true
+                    end
+                end
+                for idx, col in ipairs(columns) do
+                    if (col.name or col.alt or ""):lower() == ref_short then
+                        return row[idx], true
                     end
                 end
             elseif type(row) == "table" then
-                raw_json = row[where.left.column]
-            end
-            val = json.extract(raw_json, where.left.path, where.left.as_text)
-        elseif columns then
-            for idx, col in ipairs(columns) do
-                if (col.name or col.alt):lower() == tostring(where.left):lower() then
-                    val = row[idx]
-                    break
-                end
-            end
-        elseif type(row) == "table" then
-            val = row[where.left]
-            if val == nil and type(where.left) == "string" then
-                local left_target = where.left:match("([^%.]+)$"):lower()
+                if row[col_ref] ~= nil then return row[col_ref], true end
                 for k, v in pairs(row) do
-                    if k:lower() == left_target then val = v break end
+                    if tostring(k):lower() == ref_short then return v, true end
                 end
             end
+            return nil, false
+        end
+
+        local val = nil
+        if type(where.left) == "table" and where.left.type == "JSON_EXTRACT" then
+            local json = require("europadb.sql.json")
+            local raw_json = resolve_col(where.left.column)
+            val = json.extract(raw_json, where.left.path, where.left.as_text)
+        else
+            val = resolve_col(where.left)
         end
 
         local target = where.right
-        if type(target) == "string" then
+        if where.right_type == "IDENTIFIER" and type(target) == "string" then
+            local rhs_val, found_rhs = resolve_col(target)
+            if found_rhs then target = rhs_val end
+        elseif type(target) == "string" and where.right_type ~= "STRING" then
             if target:upper() == "TRUE" then target = true
             elseif target:upper() == "FALSE" then target = false end
         end
@@ -1342,7 +1423,12 @@ function executor:_eval_where(where, row, columns)
             -- SQLite LIKE is case-insensitive for ASCII (the default)
             local lval    = tostring(val):lower()
             local ltarget = tostring(target):lower()
-            local pattern = "^" .. ltarget:gsub("%%", ".*"):gsub("_", ".") .. "$"
+            local pattern = "^" .. ltarget:gsub(".", function(c)
+                if c == "%" then return ".*"
+                elseif c == "_" then return "."
+                elseif c:match("[%(%)%.%%%+%-%*%?%[%]%^%$]") then return "%" .. c
+                else return c end
+            end) .. "$"
             return string.match(lval, pattern) ~= nil
         elseif op == "IN" then
             if val == nil or type(where.right) ~= "table" then return false end
